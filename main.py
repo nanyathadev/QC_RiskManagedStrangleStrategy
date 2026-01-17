@@ -16,6 +16,15 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
         
         # Add VIX for volatility filter
         self._vix = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
+
+        # ---- NVDA-specific volatility proxy (PRIMARY) ----
+        self._atr = self.atr(self._spy, 14, MovingAverageType.WILDERS, Resolution.DAILY)
+        self.set_warm_up(30, Resolution.DAILY)
+
+        # ATR% rules (tune these)
+        self._max_atr_pct_entry = 0.055   # skip new trades if ATR% > 5.5%
+        self._atr_low_pct = 0.030         # <3.0% = calm
+        self._atr_high_pct = 0.045        # >4.5% = elevated
         
         # Improved risk management parameters
         self._total_stop_loss_multiplier = 2.5  # Close if total position loses 2.5x initial credit
@@ -71,21 +80,63 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
             if current_vix > self._max_vix:
                 self.debug(f"Skipping entry - VIX too high: {current_vix:.2f}")
                 return
+         
+        # ---- NVDA-specific volatility proxy: ATR% ----
+        atr_pct = self._get_atr_pct()
+        if atr_pct is None:
+            self.debug("ATR% not ready yet")
+            return
+
+        # Entry skip in extreme NVDA volatility regimes
+        if atr_pct > self._max_atr_pct_entry:
+            self.debug(f"Skipping entry - NVDA ATR% too high: {atr_pct*100:.2f}%")
+            return
+
+        # Dynamic sizing based on NVDA ATR%
+        # lower ATR% => slightly bigger size; higher ATR% => smaller size
+        if atr_pct < self._atr_low_pct:
+            size_multiplier = 1.25
+        elif atr_pct > self._atr_high_pct:
+            size_multiplier = 0.65
+        else:
+            size_multiplier = 1.0
+
+        adjusted_size_pct = self._base_position_size_pct * size_multiplier
             
         # Get option chain
         chain = data.option_chains.get(self._spy_option)
         if not chain:
             return
+
+        # ---- Expiry-first selection (30-45 DTE) ----
+        target_dte_min, target_dte_max = 30, 45
+
+        expiries = sorted({
+            x.expiry for x in chain
+            if target_dte_min <= (x.expiry - self.time).days <= target_dte_max
+            and x.greeks and x.greeks.delta is not None
+        })
+
+        if not expiries:
+            self.debug("No expiries in 30-45 DTE with greeks")
+            return
+
+        # Choose the nearest expiry in the window (most liquid typically)
+        expiry = expiries[0]
             
         # Filter for options expiring in 30-45 days with valid greeks
-        calls = [x for x in chain if x.right == OptionRight.CALL 
-                 and 30 <= (x.expiry - self.time).days <= 45
-                 and x.greeks and x.greeks.delta]
-        puts = [x for x in chain if x.right == OptionRight.PUT 
-                and 30 <= (x.expiry - self.time).days <= 45
-                and x.greeks and x.greeks.delta]
-        
+        calls = [x for x in chain
+                if x.expiry == expiry and x.right == OptionRight.CALL
+                and x.greeks and x.greeks.delta is not None
+                and x.bid_price > 0 and x.ask_price > 0]
+
+        puts = [x for x in chain
+                if x.expiry == expiry and x.right == OptionRight.PUT
+                and x.greeks and x.greeks.delta is not None
+                and x.bid_price > 0 and x.ask_price > 0]
+
         if not calls or not puts:
+            self.debug("No calls/puts for chosen expiry with valid bid/ask + greeks")
             return
         
         # Find 10 delta options with tighter tolerance
@@ -118,7 +169,18 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
         if abs(abs(put_contract.greeks.delta) - target_delta) > tol:
             self.debug(f"No suitable PUT delta. Best={abs(put_contract.greeks.delta):.3f}")
             return
+
+        # Spread sanity check (skip wide markets)
+        def spread_ok(c):
+            mid = 0.5 * (c.bid_price + c.ask_price)
+            if mid <= 0:
+                return False
+            return (c.ask_price - c.bid_price) <= mid * 0.08   # <= 8% of mid
         
+        if not spread_ok(call_contract) or not spread_ok(put_contract):
+            self.debug("Skipping entry - spreads too wide")
+            return
+
         # Dynamic position sizing based on VIX
         current_vix = data[self._vix].value if self._vix in data and data[self._vix] else 15
         
@@ -137,13 +199,21 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
         max_contracts = 1
         # max(1, int(self.portfolio.total_portfolio_value * adjusted_size_pct / option_premium))
         
+        # --- Place limit orders near mid (better fills than market orders) ---
+        def mid_price(c):
+            return round(0.5 * (c.bid_price + c.ask_price), 2)
+
+        call_mid = mid_price(call_contract)
+        put_mid  = mid_price(put_contract)
+
         # Sell contracts
-        call_ticket = self.market_order(call_contract.symbol, -max_contracts)
-        put_ticket = self.market_order(put_contract.symbol, -max_contracts)
-        
-        # Calculate initial credit received
-        call_fill_price = call_ticket.average_fill_price if call_ticket.average_fill_price else call_contract.bid_price
-        put_fill_price = put_ticket.average_fill_price if put_ticket.average_fill_price else put_contract.bid_price
+        call_ticket = self.limit_order(call_contract.symbol, -max_contracts, call_mid)
+        put_ticket  = self.limit_order(put_contract.symbol,  -max_contracts, put_mid)
+                
+        # Use mid as expected fill if not filled yet (more realistic than assuming best-case)
+        call_fill_price = call_ticket.average_fill_price if call_ticket.average_fill_price else call_mid
+        put_fill_price  = put_ticket.average_fill_price if put_ticket.average_fill_price else put_mid
+
         total_credit = (call_fill_price + put_fill_price) * 100 * max_contracts
         
         # Store position details with unique key
@@ -185,10 +255,13 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
                 positions_to_close.append(key)
                 continue
             
-            # Get current prices and greeks
-            call_price = self.securities[call_symbol].price if call_invested else 0
-            put_price = self.securities[put_symbol].price if put_invested else 0
-            
+            # For short options, realistic close cost is the ASK (you pay ask to buy-to-close)
+            call_sec = self.securities[call_symbol]
+            put_sec  = self.securities[put_symbol]
+
+            call_price = call_sec.ask_price if call_invested and call_sec.ask_price > 0 else call_sec.price
+            put_price  = put_sec.ask_price  if put_invested and put_sec.ask_price > 0 else put_sec.price
+
             # Calculate current P&L
             call_pnl = (position['call_open_price'] - call_price) * 100 * quantity if call_invested else 0
             put_pnl = (position['put_open_price'] - put_price) * 100 * quantity if put_invested else 0
@@ -253,3 +326,10 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
         # Remove fully closed positions
         for key in positions_to_close:
             del self._open_positions[key]
+
+    def _get_atr_pct(self) -> float:
+        price = self.securities[self._spy].price
+        if self.is_warming_up or not self._atr.is_ready or price <= 0:
+            return None
+        return float(self._atr.current.value) / float(price)
+
