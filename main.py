@@ -585,11 +585,12 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
             self.debug(f"Skipping covered call — spread too wide: {spread_pct:.1f}% (max {self.max_spread_pct_of_mid*100:.1f}%)")
             return
 
-        # Only sell CCs for shares we actually own (safety check)
-        max_contracts = nvda_shares // 100
+        # Sell covered calls for ALL assigned shares
+        contracts = nvda_shares // 100
         
-        # Conservative: only sell 1 CC at a time to minimize assignment risk
-        contracts = min(1, max_contracts)
+        if contracts < 1:
+            self.debug(f"Not enough shares for CC: {nvda_shares} shares = {contracts} contracts")
+            return
         
         limit_px = self._mid(call.bid_price, call.ask_price)
         if limit_px <= 0:
@@ -599,4 +600,4 @@ class RiskManagedStrangleStrategy(QCAlgorithm):
         self.limit_order(call.symbol, -contracts, limit_px)
         self.wheel_cc_symbol = call.symbol
 
-        self.debug(f"SELL CC: {call.symbol} qty={contracts}/{max_contracts} Δ={call.greeks.delta:.2f} strike={call.strike} spot={spot:.2f} DTE={((call.expiry - self.time).days)} premium=${limit_px:.2f}")
+        self.debug(f"SELL CC: {call.symbol} qty={contracts} (ALL shares) Δ={call.greeks.delta:.2f} strike={call.strike} spot={spot:.2f} DTE={((call.expiry - self.time).days)} premium=${limit_px:.2f}")
